@@ -4,7 +4,7 @@ import numpy as np
 import librosa
 import gradio as gr
 
-from typing import Callable
+from typing import Callable, Optional
 from pathlib import Path
 
 import torch
@@ -25,13 +25,13 @@ from tria.constants import PRETRAINED_DIR, ASSETS_DIR
 # Spectrogram plots
 SPEC_MELS = 128
 SMALL_WIDTH = 900  # Timbre/rhythm prompts
-LARGE_WIDTH = 600  # Generated outputs
+LARGE_WIDTH = 1200  # Generated outputs
 
 # Device
 DEVICE = None
 
 # Batched outputs
-N_OUTPUTS = 3
+N_OUTPUTS = 1
 
 # Loaded configuration
 LOADED = dict(
@@ -58,7 +58,7 @@ MODEL_ZOO = {
             "mult": 4,
             "p_dropout": 0.0,
             "bias": True,
-            "max_len": 1000,
+            "max_len": 2000,
             "pos_enc": "rope",
             "qk_norm": True,
             "use_sdpa": True,
@@ -88,13 +88,15 @@ MODEL_ZOO = {
             "guidance_scale": 2.0,
             "causal_bias": 1.0,
         },
-        "max_duration": 6.0,
+        "max_duration": 12.0,
     },
 }
 
 
 # Example audio
-TIMBRE_EXAMPLE = ASSETS_DIR / "drums" / "drums_1.wav"
+# Use absolute path relative to this file
+BASE_DIR = Path(__file__).parent
+TIMBRE_EXAMPLE_DIR = BASE_DIR / "example_timbre"
 RHYTHM_EXAMPLE = ASSETS_DIR / "beatbox" / "beatbox_1.wav"
 
 ########################################
@@ -227,7 +229,10 @@ def load_model_by_name(name: str):
     cfg = MODEL_ZOO[name]
 
     model = TRIA(**cfg["model_cfg"])
-    sd = torch.load(cfg["checkpoint"], map_location="cpu")
+    # PyTorch 2.6부터 torch.load 기본값이 weights_only=True로 바뀌어
+    # 예전 방식으로 저장된 체크포인트를 읽을 때 UnpicklingError가 발생하므로,
+    # 신뢰할 수 있는 파일에 한해 weights_only=False를 명시적으로 사용한다.
+    sd = torch.load(cfg["checkpoint"], map_location="cpu", weights_only=False)
     model.load_state_dict(sd, strict=True)
     model.to(device)
     model.eval()
@@ -323,6 +328,8 @@ def _inference(
     sampling_ctrls, inference_ctrls, 
     audio_ctrls, schedule_ctrls,
     seed,
+    override_buffer_dur: Optional[float] = None,
+    override_prefix_dur: Optional[float] = None,
 ):
    
     if LOADED["model"] is None or LOADED["tokenizer"] is None or LOADED["feature_fn"] is None:
@@ -332,14 +339,19 @@ def _inference(
 
     feat_fn = LOADED["feature_fn"]
     tokenizer = LOADED["tokenizer"]
-    buffer_dur = LOADED["max_duration"]
+    # Use overridden buffer duration if provided, else use model default
+    buffer_dur = override_buffer_dur if override_buffer_dur is not None else LOADED["max_duration"]
     sample_rate = LOADED["sample_rate"]
     tokenizer = LOADED["tokenizer"]
     model = LOADED["model"]
     interp = model.interp
 
-    # Prefix mode: default to max length of 1/3 buffer
-    prefix_dur = int(buffer_dur / 3)
+    # Prefix mode
+    if override_prefix_dur is not None:
+        prefix_dur = override_prefix_dur
+    else:
+        # Default to max length of 1/3 buffer
+        prefix_dur = int(buffer_dur / 3)
     
     # Optionally filter rhythm audio
     if audio_ctrls["filter_inputs"]:
@@ -419,11 +431,39 @@ def handle_audio_change(audio_tuple):
     return spectrogram_fast(signal, small=True)
 
 
-def load_example_timbre():
+def scan_example_timbres():
     """
-    Return a gr.Audio value and a spectrogram image.
+    Scan example timbres from directory.
     """
-    signal = AudioSignal(TIMBRE_EXAMPLE)
+    if not TIMBRE_EXAMPLE_DIR.exists():
+        return []
+    
+    files = []
+    for ext in ['*.wav', '*.mp3', '*.flac']:
+        files.extend(list(TIMBRE_EXAMPLE_DIR.glob(ext)))
+    
+    # Sort by name
+    files = sorted(files, key=lambda x: x.name)
+    return [str(f) for f in files]
+
+
+def on_refresh_examples():
+    """
+    Refresh example timbres list.
+    """
+    files = scan_example_timbres()
+    # Return updated choices for the dropdown
+    return gr.Dropdown(choices=files, value=None)
+
+
+def on_load_example_from_dropdown(filepath):
+    """
+    Load audio from selected dropdown file.
+    """
+    if not filepath:
+        return None, None
+    
+    signal = AudioSignal(filepath)
     return to_gradio_audio(signal), spectrogram_fast(signal, small=True)
 
 
@@ -446,7 +486,8 @@ def on_generate(
     top_p, top_k, temperature, mask_temperature,
     seed, causal_bias, cfg_scale,
     loudness_db, filter_inputs,
-    *schedule_vals
+    *schedule_vals,
+    progress=gr.Progress()
 ):
     # Ensure model up-to-date
     if LOADED["name"] != model_name:
@@ -473,21 +514,175 @@ def on_generate(
     timbre_prompt = from_gradio_audio(*timbre_prompt)
     rhythm_prompt = from_gradio_audio(*rhythm_prompt)
     
-    # Batch inputs
-    timbre_prompt = AudioSignal.batch([timbre_prompt]*N_OUTPUTS)
-    rhythm_prompt = AudioSignal.batch([rhythm_prompt]*N_OUTPUTS)
+    # === Overlap-Add Logic ===
+    
+    # Settings for overlap-add
+    SEGMENT_DUR = 8.0  # Total buffer size for generation
+    OVERLAP_DUR = 1.0  # Overlap between segments
+    PREFIX_DUR = 2.0   # Timbre prompt duration within the segment
+    
+    # Effective duration generated per step (excluding prefix)
+    # The model takes prefix + rhythm_chunk.
+    # Total buffer = PREFIX_DUR + RHYTHM_CHUNK_DUR
+    # We want SEGMENT_DUR = 8.0
+    # So Rhythm Chunk size = 6.0
+    RHYTHM_CHUNK_DUR = SEGMENT_DUR - PREFIX_DUR
+    
+    # Step size for moving through the input rhythm
+    # We want overlap of 1.0 sec in the output.
+    # So we advance by RHYTHM_CHUNK_DUR - OVERLAP_DUR
+    STEP_SIZE = RHYTHM_CHUNK_DUR - OVERLAP_DUR
+    
+    total_duration = rhythm_prompt.duration
+    
+    # If total duration is short enough, just run once
+    if total_duration <= RHYTHM_CHUNK_DUR:
+         # Batch inputs
+        timbre_prompt_batch = AudioSignal.batch([timbre_prompt]*N_OUTPUTS)
+        rhythm_prompt_batch = AudioSignal.batch([rhythm_prompt]*N_OUTPUTS)
+        
+        # We use a custom buffer duration here to match the exact length needed + prefix
+        # But actually _inference truncates rhythm prompt to fit buffer - prefix.
+        # So we can just set buffer_dur = PREFIX + total_duration
+        current_buffer_dur = PREFIX_DUR + total_duration
+        
+        out, msg = _inference(
+            timbre_prompt_batch, rhythm_prompt_batch,
+            sampling_ctrls, inference_ctrls, 
+            audio_ctrls, schedule_ctrls, seed,
+            override_buffer_dur=current_buffer_dur,
+            override_prefix_dur=PREFIX_DUR
+        )
+        final_output = out.cpu()
+        
+    else:
+        # Long audio: Split and Overlap-Add
+        progress(0, desc="Starting generation...")
+        
+        # Resample upfront to avoid issues
+        rhythm_prompt = rhythm_prompt.resample(sample_rate)
+        timbre_prompt = timbre_prompt.resample(sample_rate)
+        
+        # Calculate number of segments
+        # We need to cover total_duration
+        # First segment covers [0, RHYTHM_CHUNK_DUR]
+        # Next starts at STEP_SIZE...
+        
+        num_segments = math.ceil((total_duration - OVERLAP_DUR) / STEP_SIZE)
+        if num_segments < 1: num_segments = 1
+        
+        full_output = torch.zeros(
+            N_OUTPUTS, 1, int(total_duration * sample_rate) + int(sample_rate), # slightly larger buffer
+            device='cpu'
+        )
+        # Weight buffer for normalization
+        weight_buffer = torch.zeros(
+             1, 1, full_output.shape[-1],
+             device='cpu'
+        )
+        
+        # Create crossfade window
+        # Overlap region is OVERLAP_DUR seconds
+        overlap_samples = int(OVERLAP_DUR * sample_rate)
+        fade_in = torch.linspace(0, 1, overlap_samples)
+        fade_out = torch.linspace(1, 0, overlap_samples)
+        
+        # Main loop
+        current_time = 0.0
+        
+        for i in range(num_segments):
+            progress(i / num_segments, desc=f"Generating segment {i+1}/{num_segments}")
+            
+            # Extract chunk
+            # If it's the last chunk, take what's left, but minimum length constraints apply
+            chunk_start = i * STEP_SIZE
+            chunk_end = min(chunk_start + RHYTHM_CHUNK_DUR, total_duration)
+            
+            # Ensure we have enough audio for the chunk, padding if necessary (though min duration handles this)
+            # Actually AudioSignal truncate handles cropping.
+            
+            # We need to pass a rhythm prompt that starts at chunk_start
+            # and has duration = chunk_end - chunk_start
+            
+            # Slice audio
+            start_sample = int(chunk_start * sample_rate)
+            end_sample = int(chunk_end * sample_rate)
+            
+            rhythm_chunk = rhythm_prompt.clone()
+            rhythm_chunk.audio_data = rhythm_chunk.audio_data[..., start_sample:end_sample]
+            
+            chunk_dur = rhythm_chunk.duration
+            
+            # Prepare batch
+            timbre_batch = AudioSignal.batch([timbre_prompt]*N_OUTPUTS)
+            rhythm_batch = AudioSignal.batch([rhythm_chunk]*N_OUTPUTS)
+            
+            # Inference
+            # Buffer duration for this call = PREFIX + chunk_dur
+            current_buffer_dur = PREFIX_DUR + chunk_dur
+            
+            # Ensure it's not too small for the model (though our chunks are large enough usually)
+            
+            out_chunk, msg = _inference(
+                timbre_batch, rhythm_batch,
+                sampling_ctrls, inference_ctrls, 
+                audio_ctrls, schedule_ctrls, seed,
+                override_buffer_dur=current_buffer_dur,
+                override_prefix_dur=PREFIX_DUR
+            )
+            out_chunk = out_chunk.cpu()
+            
+            # Add to full output
+            # out_chunk contains the generated rhythm (corresponding to rhythm_chunk)
+            # Its length should match rhythm_chunk length in samples approximately
+            
+            chunk_data = out_chunk.audio_data # (B, 1, T)
+            T_chunk = chunk_data.shape[-1]
+            
+            # Define global position
+            global_start = int(chunk_start * sample_rate)
+            global_end = global_start + T_chunk
+            
+            # Apply windowing for crossfade if not first/last
+            # Ideally we window the overlap regions.
+            # Simple OLA: standard trapezoidal window or similar
+            # But here we specified fade-in/fade-out in overlap.
+            
+            # Construct a window for this chunk
+            window = torch.ones(1, 1, T_chunk)
+            
+            # Fade in (if not first segment)
+            if i > 0:
+                window[..., :overlap_samples] = fade_in
+            
+            # Fade out (if not last segment)
+            if i < num_segments - 1:
+                # The end of this chunk overlaps with the next
+                # The overlap starts at T_chunk - overlap_samples
+                window[..., -overlap_samples:] = fade_out
+            
+            # Add
+            full_output[..., global_start:global_end] += chunk_data * window
+            weight_buffer[..., global_start:global_end] += window
+            
+        
+        # Normalize by weight
+        # Avoid division by zero
+        mask = weight_buffer > 1e-6
+        full_output[mask] /= weight_buffer[mask]
+        
+        # Create final AudioSignal
+        # Trim to exact length
+        final_len = int(total_duration * sample_rate)
+        full_output = full_output[..., :final_len]
+        
+        final_output = AudioSignal(full_output, sample_rate)
+        final_output.normalize(audio_ctrls["loudness_db"])
+        final_output.ensure_max_of_audio()
 
-    out, msg = _inference(
-        timbre_prompt, rhythm_prompt,
-        sampling_ctrls, inference_ctrls, 
-        audio_ctrls, schedule_ctrls, seed,
-    )
-    out = out.cpu()
-
-    out_audio = [to_gradio_audio(out[i]) for i in range(N_OUTPUTS)]
+    out_audio = [to_gradio_audio(final_output)] # Single output
     out_specs = [
-        spectrogram_fast(out[i], small=False)
-        for i in range(N_OUTPUTS)
+        spectrogram_fast(final_output, small=False)
     ]
 
     return out_audio + out_specs + [msg]
@@ -497,9 +692,10 @@ def on_generate(
 # Interface
 ########################################
 
+example_files = scan_example_timbres()
 
-with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🥁 TRIA: The Rhythm In Anything 🥁")
+with gr.Blocks(title="Voice to Drum") as demo:
+    gr.Markdown("# 🥁 Voice to Drum 🥁")
     gr.Markdown(
         "Select a **Model**, load **Timbre** + **Rhythm** prompts (record or upload). "
         "Click **Generate**."
@@ -509,32 +705,50 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
     with gr.Row():
         with gr.Column():
             gr.Markdown("### Timbre Prompt")
-            timbre_audio = gr.Audio(sources=["upload", "microphone"], type="numpy",
-                                    label="Timbre Audio", show_download_button=True)
-            timbre_spec = gr.Image(label="Timbre Spectrogram", show_download_button=True)
-            btn_timbre_ex = gr.Button("Load Example Timbre", variant="secondary")
+            timbre_audio = gr.Audio(
+                sources=["upload", "microphone"],
+                type="numpy",
+                label="Timbre Audio",
+            )
+            
+            # Dynamic Example Selection
+            with gr.Row():
+                example_dropdown = gr.Dropdown(
+                    label="Example Timbres", 
+                    choices=example_files,
+                    value=None,
+                    scale=3
+                )
+                refresh_btn = gr.Button("🔄", scale=0)
+            
+            timbre_spec = gr.Image(label="Timbre Spectrogram")
+            
         with gr.Column():
             gr.Markdown("### Rhythm Prompt")
-            rhythm_audio = gr.Audio(sources=["upload", "microphone"], type="numpy",
-                                    label="Rhythm Audio", show_download_button=True)
-            rhythm_spec = gr.Image(label="Rhythm Spectrogram", show_download_button=True)
+            rhythm_audio = gr.Audio(
+                sources=["upload", "microphone"],
+                type="numpy",
+                label="Rhythm Audio",
+            )
+            rhythm_spec = gr.Image(label="Rhythm Spectrogram")
             btn_rhythm_ex = gr.Button("Load Example Rhythm", variant="secondary")
 
     # Outputs row
-    gr.Markdown("### Generated Outputs (Batch of 3)")
+    gr.Markdown("### Generated Output")
     generate_btn = gr.Button("Generate", variant="primary")
 
     
     with gr.Row():
         with gr.Column():
-            out_audio_1 = gr.Audio(type="numpy", label="Generated #1", interactive=False, show_download_button=True)
-            out_spec_1  = gr.Image(label="Spectrogram #1", show_download_button=True)
-        with gr.Column():
-            out_audio_2 = gr.Audio(type="numpy", label="Generated #2", interactive=False, show_download_button=True)
-            out_spec_2  = gr.Image(label="Spectrogram #2", show_download_button=True)
-        with gr.Column():
-            out_audio_3 = gr.Audio(type="numpy", label="Generated #3", interactive=False, show_download_button=True)
-            out_spec_3  = gr.Image(label="Spectrogram #3", show_download_button=True)
+            out_audio_1 = gr.Audio(
+                type="numpy",
+                label="Generated Audio",
+                interactive=False,
+            )
+            out_spec_1  = gr.Image(label="Spectrogram")
+        
+        # Removed extra outputs
+    
     params_text = gr.Markdown("")
 
     # Controls bottom: 2 columns (left: Model + Sampling + Audio; right: Schedule)
@@ -574,8 +788,16 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
     timbre_audio.change(fn=handle_audio_change, inputs=timbre_audio, outputs=[timbre_spec], show_progress="hidden")
     rhythm_audio.change(fn=handle_audio_change, inputs=rhythm_audio, outputs=[rhythm_spec], show_progress="hidden")
 
+    # Example Refresh & Load
+    refresh_btn.click(fn=on_refresh_examples, inputs=None, outputs=example_dropdown)
+    example_dropdown.change(
+        fn=on_load_example_from_dropdown, 
+        inputs=example_dropdown, 
+        outputs=[timbre_audio, timbre_spec],
+        show_progress="hidden"
+    )
+
     # Default examples
-    btn_timbre_ex.click(fn=load_example_timbre, inputs=None, outputs=[timbre_audio, timbre_spec], show_progress="hidden")
     btn_rhythm_ex.click(fn=load_example_rhythm, inputs=None, outputs=[rhythm_audio, rhythm_spec], show_progress="hidden")
 
     # Load model and utilities
@@ -588,8 +810,8 @@ with gr.Blocks(title="TRIA: The Rhythm In Anything", theme=gr.themes.Soft()) as 
                 top_p, top_k, temperature, mask_temperature,
                 seed, causal_bias, cfg_scale,
                 loudness_db, filter_inputs, *schedule_sliders],
-        outputs=[out_audio_1, out_audio_2, out_audio_3,
-                 out_spec_1, out_spec_2, out_spec_3,
+        outputs=[out_audio_1,
+                 out_spec_1,
                  params_text],
         show_progress="full",
     )
