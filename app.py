@@ -444,7 +444,8 @@ def scan_example_timbres():
     
     # Sort by name
     files = sorted(files, key=lambda x: x.name)
-    return [str(f) for f in files]
+    # Return (filename, full_path) tuples
+    return [(f.name, str(f)) for f in files]
 
 
 def on_refresh_examples():
@@ -710,6 +711,7 @@ with gr.Blocks(title="Voice to Drum") as demo:
                 type="numpy",
                 label="Timbre Audio",
             )
+            timbre_spec = gr.Image(label="Timbre Spectrogram")
             
             # Dynamic Example Selection
             with gr.Row():
@@ -720,8 +722,6 @@ with gr.Blocks(title="Voice to Drum") as demo:
                     scale=3
                 )
                 refresh_btn = gr.Button("🔄", scale=0)
-            
-            timbre_spec = gr.Image(label="Timbre Spectrogram")
             
         with gr.Column():
             gr.Markdown("### Rhythm Prompt")
